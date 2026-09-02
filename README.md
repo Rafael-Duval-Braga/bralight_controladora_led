@@ -1,6 +1,6 @@
-# bralight_controladora_led
+# Bralight Controladora led
 
-## objetivo:
+## Objetivo:
 
 Aqui é onde se registra o firmware da luminaria bralight
 
