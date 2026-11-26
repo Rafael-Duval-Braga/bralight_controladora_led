@@ -1,43 +1,10 @@
-# Bralight — Controladora LED RGB
+## Arquitetura AP Web + Art-Net (`feat/ap-web-artnet`)
 
-Repositório dedicado ao registro e desenvolvimento do firmware para controle da luminária **Bralight**, baseado no microcontrolador **ESP32-C3** rodando **MicroPython** e integrado ao **Home Assistant** via **MQTT**.
+A arquitetura foi dividida entre duas placas rodando MicroPython:
 
----
-
-## 🎯 Objetivo
-
-Centralizar o código-fonte, a arquitetura de comunicação e a documentação de hardware da controladora de iluminação RGB da luminária Bralight.
-
----
-
-## 🔌 Arquitetura e Hardware
-
-### Esquema do Circuito
-![Rascunho do Circuito](img/Rascunho_Circuito.jpeg)
-
-### Pinagem PWM (ESP32-C3)
-| Canal | Cor | GPIO |
-| :--- | :--- | :--- |
-| **R** | Vermelho (Red) | `GPIO0` |
-| **G** | Verde (Green) | `GPIO1` |
-| **B** | Azul (Blue) | `GPIO3` |
-
----
-
-## ⚙️ Estrutura e Comunicação
-
-O sistema opera de forma distribuída na rede local utilizando o protocolo **MQTT**:
-
-* **Broker MQTT:** Hospedado via Mosquitto (`192.168.0.159:1883`), responsável por intermediar as mensagens entre a interface e o hardware.
-* **Interface de Controle (Home Assistant):** Acessível localmente pelo painel em [http://192.168.0.4:8123/light?historyBack=1](http://192.168.0.4:8123/light?historyBack=1), publicando comandos RGB no tópico `casa/luminaria/rgb`.
-* **Firmware (ESP32-C3):** Escrito em MicroPython (`src/main.py`), conecta-se ao Wi-Fi (com *Access Point* de fallback automático), subscreve no tópico MQTT e converte os valores `R,G,B` (0–255) em sinais PWM de 10 bits (0–1023).
-
----
-
-## 🚀 Como Executar e Testar
-
-A forma mais prática de transferir e executar o código MicroPython no **ESP32-C3** é utilizando a ferramenta `mpremote`:
-
-1. **Instalar a dependência MQTT (apenas na primeira configuração):**
-   ```bash
-   mpremote mip install umqtt.simple
+* **ESP32 padrão (`src/ap/main.py`, `src/ap/index.html`, `src/ap/site.js`):**
+  * Cria o Access Point Wi-Fi (`Bralight_AP`, canal `6`, até `4` clientes) sem necessidade de internet ou broker MQTT local.
+  * Serve a interface web em `<canvas>` (`/` e `/site.js`) lida em blocos a partir da flash, com roda de cores em brilho máximo (`r`, `g`, `b`) e controle separado de intensidade (`d`), usando *throttle* de ~15 Hz em `/set` e consulta inicial em `/state`.
+  * Envia quadros UDP a 10 Hz para `192.168.4.255:6454` no formato `bytes([r, g, b, d])` e persiste o último estado em `rgb_state.json` após ~2 s sem alterações.
+* **ESP32-C3 SuperMini (`src/c3/main.py`):**
+  * Recebe os comandos e realiza a dimerização/correção gamma e o acionamento das saídas da luminária.
