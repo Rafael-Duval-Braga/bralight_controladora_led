@@ -31,3 +31,4 @@ A arquitetura substitui o broker MQTT local por uma rede autônoma em **Wi-Fi So
        │  Gamma + Intensidade (d) + Fade suave
        ▼
 [Saídas PWM / Luminária RGB]
+
