@@ -89,11 +89,15 @@
     return { hue: h, sat: Math.min(1, s) };
   }
 
-  // Renderiza a roda de cores em brilho máximo (V = 1) + marcador da posição atual
-  function drawWheel() {
-    ctx.clearRect(0, 0, size, size);
+  // A roda em brilho máximo (V = 1) é calculada UMA vez num canvas fora da tela;
+  // a cada movimento só copiamos essa imagem e redesenhamos o marcador.
+  const wheelCache = document.createElement("canvas");
+  wheelCache.width = size;
+  wheelCache.height = size;
 
-    const imgData = ctx.createImageData(size, size);
+  (function buildWheelCache() {
+    const cctx = wheelCache.getContext("2d");
+    const imgData = cctx.createImageData(size, size);
     const data = imgData.data;
 
     for (let y = 0; y < size; y++) {
@@ -115,7 +119,12 @@
       }
     }
 
-    ctx.putImageData(imgData, 0, 0);
+    cctx.putImageData(imgData, 0, 0);
+  })();
+
+  function drawWheel() {
+    ctx.clearRect(0, 0, size, size);
+    ctx.drawImage(wheelCache, 0, 0);
 
     // Borda suave da roda
     ctx.beginPath();
@@ -155,16 +164,35 @@
     drawWheel();
   }
 
+  let sending = false;
+  let dirty = false;
+
   async function sendStateNow() {
+    // Um pedido por vez: cada fetch abre uma conexão TCP nova no ESP32.
+    // Se já houver um em andamento, marca que o estado mudou e reenvia depois.
+    if (sending) {
+      dirty = true;
+      return;
+    }
+    sending = true;
     const url = `/set?r=${state.r}&g=${state.g}&b=${state.b}&d=${state.d}`;
+    const ctrl = new AbortController();
+    const timeout = setTimeout(() => ctrl.abort(), 2500);
     try {
-      const resp = await fetch(url, { cache: "no-store" });
+      const resp = await fetch(url, { cache: "no-store", signal: ctrl.signal });
       if (statusEl) {
         statusEl.textContent = resp.ok ? "Sincronizado" : `HTTP ${resp.status}`;
       }
     } catch (_) {
       if (statusEl) {
         statusEl.textContent = "Sem conexão com o AP";
+      }
+    } finally {
+      clearTimeout(timeout);
+      sending = false;
+      if (dirty) {
+        dirty = false;
+        scheduleSend();
       }
     }
   }
@@ -268,7 +296,7 @@
   async function loadInitialState() {
     try {
       const resp = await fetch("/state", { cache: "no-store" });
-      if (!resp.ok) return;
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
       const data = await resp.json();
 
       state.r = Math.max(0, Math.min(255, Number(data.r ?? state.r)));
@@ -279,10 +307,12 @@
       const pos = rgbToWheelPos(state.r, state.g, state.b);
       state.hue = pos.hue;
       state.sat = pos.sat;
-    } catch (_) {
-      // Mantém estado inicial padrão se o /state ainda não responder
-    } finally {
+      if (statusEl) statusEl.textContent = "Conectado";
       updateUI();
+    } catch (_) {
+      // Ainda sem resposta do ESP32: mantém o padrão e tenta de novo em 2 s
+      if (statusEl) statusEl.textContent = "Sem conexão com o AP";
+      setTimeout(loadInitialState, 2000);
     }
   }
 

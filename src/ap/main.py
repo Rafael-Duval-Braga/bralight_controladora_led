@@ -1,378 +1,271 @@
+import asyncio
+import json
 import network
-import time
 import socket
-import struct
+import time
 
-# --- CONFIGURAÇÕES DO ACCESS POINT ---
+# --- CONFIGURAÇÕES DO ACCESS POINT E ART-NET ---
 AP_SSID = "Bralight_AP"
 AP_PASS = "bralight123"  # Mínimo 8 caracteres
-MQTT_TOPIC_RGB = "casa/luminaria/rgb"
+AP_CHANNEL = 6
+AP_MAX_CLIENTS = 4
+
+ARTNET_IP = "192.168.4.255"
+ARTNET_PORT = 6454
+ARTNET_HZ = 10
+ARTNET_INTERVAL_MS = 1000 // ARTNET_HZ
+
+STATE_FILE = "rgb_state.json"
+SAVE_DELAY_MS = 2000
+
+
+class LuminariaState:
+    def __init__(self, r=255, g=255, b=255, d=255):
+        self.r = r
+        self.g = g
+        self.b = b
+        self.d = d
+        self.dirty = False
+        self.last_change_ms = time.ticks_ms()
+
+    def update(self, r=None, g=None, b=None, d=None):
+        changed = False
+        if r is not None:
+            r = max(0, min(255, int(r)))
+            if r != self.r:
+                self.r = r
+                changed = True
+        if g is not None:
+            g = max(0, min(255, int(g)))
+            if g != self.g:
+                self.g = g
+                changed = True
+        if b is not None:
+            b = max(0, min(255, int(b)))
+            if b != self.b:
+                self.b = b
+                changed = True
+        if d is not None:
+            d = max(0, min(255, int(d)))
+            if d != self.d:
+                self.d = d
+                changed = True
+
+        if changed:
+            self.dirty = True
+            self.last_change_ms = time.ticks_ms()
+
+    def to_dict(self):
+        return {"r": self.r, "g": self.g, "b": self.b, "d": self.d}
+
+    def to_bytes(self):
+        return bytes([self.r, self.g, self.b, self.d])
+
+    def load(self):
+        try:
+            with open(STATE_FILE, "r") as f:
+                data = json.load(f)
+            self.r = max(0, min(255, int(data.get("r", self.r))))
+            self.g = max(0, min(255, int(data.get("g", self.g))))
+            self.b = max(0, min(255, int(data.get("b", self.b))))
+            self.d = max(0, min(255, int(data.get("d", self.d))))
+            self.dirty = False
+            print("Estado restaurado de", STATE_FILE, ":", self.to_dict())
+        except OSError:
+            print("Nenhum estado salvo encontrado; usando padrao:", self.to_dict())
+        except Exception as e:
+            print("Erro ao carregar estado:", e)
+
+    def save_if_needed(self):
+        if not self.dirty:
+            return
+        if time.ticks_diff(time.ticks_ms(), self.last_change_ms) >= SAVE_DELAY_MS:
+            try:
+                with open(STATE_FILE, "w") as f:
+                    json.dump(self.to_dict(), f)
+                self.dirty = False
+                print("Estado salvo em", STATE_FILE, ":", self.to_dict())
+            except Exception as e:
+                print("Erro ao salvar estado:", e)
 
 
 def iniciar_access_point():
     ap = network.WLAN(network.AP_IF)
     ap.active(True)
-    ap.config(essid=AP_SSID, password=AP_PASS, authmode=network.AUTH_WPA_WPA2_PSK)
+    ap.config(
+        essid=AP_SSID,
+        password=AP_PASS,
+        authmode=network.AUTH_WPA_WPA2_PSK,
+        channel=AP_CHANNEL,
+        max_clients=AP_MAX_CLIENTS,
+    )
 
     while not ap.active():
-        time.sleep(0.1)
+        time.sleep_ms(100)
 
     ip = ap.ifconfig()[0]
     print("\n--- Bralight Access Point Iniciado ---")
     print("SSID:", AP_SSID)
-    print("Senha:", AP_PASS)
-    print("IP local (Web + Broker):", ip)
+    print("Canal:", AP_CHANNEL, "| Max clientes:", AP_MAX_CLIENTS)
+    print("IP local (Web):", ip)
     return ip
 
 
-# --- MINI BROKER MQTT EM PYTHON PURO ---
-class MiniMQTTBroker:
-    def __init__(self, port=1883):
-        self.port = port
-        self.clients = []        # Lista de sockets MQTT conectados
-        self.subscriptions = {}  # {client_socket: [lista_de_topicos]}
+def parse_query_params(raw_target):
+    if "?" not in raw_target:
+        return {}
+    query = raw_target.split("?", 1)[1]
+    params = {}
+    for pair in query.split("&"):
+        if "=" in pair:
+            k, v = pair.split("=", 1)
+            params[k] = v
+    return params
 
-    def start(self):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind(("0.0.0.0", self.port))
-        self.sock.listen(5)
-        self.sock.setblocking(False)
-        print(f"Broker MQTT escutando na porta {self.port}...")
 
-    def _encode_remaining_length(self, length):
-        encoded = bytearray()
+def content_type_for(path):
+    if path.endswith(".html"):
+        return "text/html; charset=utf-8"
+    if path.endswith(".js"):
+        return "application/javascript; charset=utf-8"
+    if path.endswith(".css"):
+        return "text/css; charset=utf-8"
+    if path.endswith(".json"):
+        return "application/json; charset=utf-8"
+    return "application/octet-stream"
+
+
+async def send_file_chunked(writer, filepath):
+    ctype = content_type_for(filepath)
+    header = (
+        "HTTP/1.1 200 OK\r\n"
+        f"Content-Type: {ctype}\r\n"
+        "Cache-Control: no-cache\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode("utf-8")
+    writer.write(header)
+    await writer.drain()
+
+    with open(filepath, "rb") as f:
         while True:
-            digit = length % 128
-            length //= 128
-            if length > 0:
-                digit |= 0x80
-            encoded.append(digit)
-            if length == 0:
+            chunk = f.read(512)
+            if not chunk:
                 break
-        return encoded
-
-    def _decode_remaining_length(self, sock):
-        multiplier = 1
-        value = 0
-        while True:
-            b = sock.recv(1)
-            if not b:
-                return None
-            digit = b[0]
-            value += (digit & 127) * multiplier
-            if (digit & 128) == 0:
-                break
-            multiplier *= 128
-        return value
-
-    def publish(self, topic, payload):
-        """Publica uma mensagem diretamente para clientes MQTT inscritos (usado pela Web API)."""
-        topic_bytes = topic.encode()
-        payload_bytes = payload.encode()
-        var_header = struct.pack("!H", len(topic_bytes)) + topic_bytes
-        remaining = var_header + payload_bytes
-        packet = b"\x30" + self._encode_remaining_length(len(remaining)) + remaining
-
-        print(f"[WEB -> {topic}]: {payload}")
-        for client, topics in list(self.subscriptions.items()):
-            if topic in topics or "#" in topics:
-                try:
-                    client.send(packet)
-                except Exception:
-                    self._remove_client(client)
-
-    def _remove_client(self, client):
-        if client in self.clients:
-            self.clients.remove(client)
-        if client in self.subscriptions:
-            del self.subscriptions[client]
-        try:
-            client.close()
-        except Exception:
-            pass
-        print("Cliente MQTT desconectado.")
-
-    def loop(self):
-        # 1. Aceita novas conexões MQTT
-        try:
-            conn, addr = self.sock.accept()
-            conn.setblocking(False)
-            self.clients.append(conn)
-            self.subscriptions[conn] = []
-            print("Novo cliente MQTT conectado:", addr[0])
-        except OSError:
-            pass
-
-        # 2. Processa pacotes dos clientes conectados
-        for client in list(self.clients):
-            try:
-                header = client.recv(1)
-                if not header:
-                    self._remove_client(client)
-                    continue
-
-                pkt_type = header[0] >> 4
-                rem_len = self._decode_remaining_length(client)
-                if rem_len is None:
-                    self._remove_client(client)
-                    continue
-
-                data = b""
-                while len(data) < rem_len:
-                    chunk = client.recv(rem_len - len(data))
-                    if not chunk:
-                        break
-                    data += chunk
-
-                # CONNECT (1) -> Responde CONNACK
-                if pkt_type == 1:
-                    client.send(b"\x20\x02\x00\x00")
-
-                # PUBLISH (3) -> Encaminha para inscritos
-                elif pkt_type == 3:
-                    topic_len = struct.unpack("!H", data[:2])[0]
-                    topic = data[2 : 2 + topic_len].decode()
-                    qos = (header[0] & 0x06) >> 1
-                    idx = 2 + topic_len
-                    if qos > 0:
-                        pkt_id = data[idx : idx + 2]
-                        idx += 2
-                        client.send(b"\x40\x02" + pkt_id)  # PUBACK
-                    payload = data[idx:].decode()
-                    print(f"[{topic}]: {payload}")
-                    self.publish(topic, payload)
-
-                # SUBSCRIBE (8) -> Registra tópico e responde SUBACK
-                elif pkt_type == 8:
-                    pkt_id = data[:2]
-                    idx = 2
-                    ack_codes = bytearray()
-                    while idx < len(data):
-                        t_len = struct.unpack("!H", data[idx : idx + 2])[0]
-                        topic = data[idx + 2 : idx + 2 + t_len].decode()
-                        self.subscriptions[client].append(topic)
-                        print(f"Cliente inscrito em: {topic}")
-                        ack_codes.append(0x00)
-                        idx += 2 + t_len + 1
-                    rem = pkt_id + ack_codes
-                    client.send(b"\x90" + self._encode_remaining_length(len(rem)) + rem)
-
-                # PINGREQ (12) -> Responde PINGRESP
-                elif pkt_type == 12:
-                    client.send(b"\xd0\x00")
-
-                # DISCONNECT (14)
-                elif pkt_type == 14:
-                    self._remove_client(client)
-
-            except OSError:
-                pass
-            except Exception as e:
-                print("Erro no cliente MQTT:", e)
-                self._remove_client(client)
+            writer.write(chunk)
+            await writer.drain()
 
 
-# --- SERVIDOR WEB HTTP LEVE (PORTA 80) ---
-HTML_PAGE = """<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Bralight RGB</title>
-  <style>
-    body {
-      font-family: system-ui, -apple-system, sans-serif;
-      background: #121212;
-      color: #f4f4f5;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      min-height: 100vh;
-      margin: 0;
-    }
-    .card {
-      background: #1e1e24;
-      padding: 24px;
-      border-radius: 16px;
-      width: 100%;
-      max-width: 340px;
-      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
-      text-align: center;
-    }
-    h1 { margin: 0 0 6px; font-size: 1.4rem; }
-    p { margin: 0 0 20px; color: #a1a1aa; font-size: 0.9rem; }
-    input[type="color"] {
-      width: 120px;
-      height: 120px;
-      border: none;
-      background: none;
-      cursor: pointer;
-      margin-bottom: 16px;
-    }
-    .rgb-readout {
-      font-family: monospace;
-      background: #121212;
-      padding: 8px 12px;
-      border-radius: 8px;
-      margin-bottom: 18px;
-      font-size: 0.95rem;
-    }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(3, 1fr);
-      gap: 8px;
-      margin-bottom: 12px;
-    }
-    button {
-      border: none;
-      border-radius: 10px;
-      padding: 10px 8px;
-      font-weight: 600;
-      cursor: pointer;
-      color: #fff;
-      background: #2e2e38;
-    }
-    button:active { transform: scale(0.97); }
-    .off { width: 100%; background: #3f3f46; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>Bralight Control</h1>
-    <p>AP Local · Tópico: casa/luminaria/rgb</p>
-    <input id="picker" type="color" value="#ff0000" />
-    <div id="readout" class="rgb-readout">RGB: 255, 0, 0</div>
-    <div class="grid">
-      <button style="background:#dc2626" onclick="setRGB(255,0,0)">Vermelho</button>
-      <button style="background:#16a34a" onclick="setRGB(0,255,0)">Verde</button>
-      <button style="background:#2563eb" onclick="setRGB(0,0,255)">Azul</button>
-    </div>
-    <button class="off" onclick="setRGB(0,0,0)">Desligar (0,0,0)</button>
-  </div>
-
-  <script>
-    const picker = document.getElementById("picker");
-    const readout = document.getElementById("readout");
-    let timer = null;
-
-    function hexToRgb(hex) {
-      const n = parseInt(hex.slice(1), 16);
-      return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
-    }
-
-    function sendCommand(r, g, b) {
-      readout.textContent = `RGB: ${r}, ${g}, ${b}`;
-      fetch(`/rgb?r=${r}&g=${g}&b=${b}`).catch(() => {});
-    }
-
-    function setRGB(r, g, b) {
-      const hex = "#" + [r, g, b].map(x => x.toString(16).padStart(2, "0")).join("");
-      picker.value = hex;
-      sendCommand(r, g, b);
-    }
-
-    picker.addEventListener("input", () => {
-      const [r, g, b] = hexToRgb(picker.value);
-      readout.textContent = `RGB: ${r}, ${g}, ${b}`;
-      clearTimeout(timer);
-      timer = setTimeout(() => sendCommand(r, g, b), 80);
-    });
-  </script>
-</body>
-</html>
-"""
-
-
-class MiniWebServer:
-    def __init__(self, broker, port=80):
-        self.broker = broker
-        self.port = port
-
-    def start(self):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind(("0.0.0.0", self.port))
-        self.sock.listen(4)
-        self.sock.setblocking(False)
-        print(f"Servidor Web escutando na porta {self.port}...")
-
-    def _parse_rgb_query(self, path):
-        # Ex.: /rgb?r=255&g=10&b=0
-        if "?" not in path:
-            return None
-        query = path.split("?", 1)[1]
-        params = {}
-        for part in query.split("&"):
-            if "=" in part:
-                k, v = part.split("=", 1)
-                params[k] = v
-        try:
-            r = max(0, min(255, int(params.get("r", 0))))
-            g = max(0, min(255, int(params.get("g", 0))))
-            b = max(0, min(255, int(params.get("b", 0))))
-            return r, g, b
-        except ValueError:
-            return None
-
-    def loop(self):
-        try:
-            conn, addr = self.sock.accept()
-            conn.settimeout(1.0)
-        except OSError:
+async def handle_client(reader, writer, state):
+    try:
+        request_line = await asyncio.wait_for(reader.readline(), timeout=2.0)
+        if not request_line:
             return
 
-        try:
-            req = conn.recv(1024).decode("utf-8", "ignore")
-            first_line = req.splitlines()[0] if req else ""
-            parts = first_line.split(" ")
-            path = parts[1] if len(parts) >= 2 else "/"
+        # Consome o restante dos cabeçalhos HTTP
+        while True:
+            line = await asyncio.wait_for(reader.readline(), timeout=2.0)
+            if not line or line == b"\r\n":
+                break
 
-            if path.startswith("/rgb"):
-                rgb = self._parse_rgb_query(path)
-                if rgb is not None:
-                    payload = f"{rgb[0]},{rgb[1]},{rgb[2]}"
-                    self.broker.publish(MQTT_TOPIC_RGB, payload)
-                    body = f'{{"status":"ok","rgb":"{payload}"}}'
-                    resp = (
-                        "HTTP/1.1 200 OK\r\n"
-                        "Content-Type: application/json\r\n"
-                        "Connection: close\r\n\r\n" + body
-                    )
-                else:
-                    resp = (
-                        "HTTP/1.1 400 Bad Request\r\n"
-                        "Content-Type: text/plain\r\n"
-                        "Connection: close\r\n\r\nParametros r,g,b invalidos"
-                    )
-            else:
-                body = HTML_PAGE.encode("utf-8")
-                resp = (
-                    b"HTTP/1.1 200 OK\r\n"
-                    b"Content-Type: text/html; charset=utf-8\r\n"
-                    b"Connection: close\r\n\r\n" + body
-                )
+        parts = request_line.decode("utf-8", "ignore").strip().split(" ")
+        target = parts[1] if len(parts) >= 2 else "/"
+        path = target.split("?", 1)[0]
 
-            conn.sendall(resp if isinstance(resp, bytes) else resp.encode("utf-8"))
-        except Exception as e:
-            print("Erro na requisicao HTTP:", e)
-        finally:
+        if path == "/":
+            await send_file_chunked(writer, "index.html")
+
+        elif path == "/site.js":
+            await send_file_chunked(writer, "site.js")
+
+        elif path == "/favicon.ico":
+            writer.write(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+            await writer.drain()
+
+        elif path == "/state":
+            body = json.dumps(state.to_dict()).encode("utf-8")
+            resp = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: application/json; charset=utf-8\r\n"
+                b"Cache-Control: no-cache\r\n"
+                b"Connection: close\r\n\r\n" + body
+            )
+            writer.write(resp)
+            await writer.drain()
+
+        elif path == "/set":
+            params = parse_query_params(target)
             try:
-                conn.close()
-            except Exception:
-                pass
+                r = int(params["r"]) if "r" in params else None
+                g = int(params["g"]) if "g" in params else None
+                b = int(params["b"]) if "b" in params else None
+                d = int(params["d"]) if "d" in params else None
+                state.update(r=r, g=g, b=b, d=d)
+                writer.write(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                await writer.drain()
+            except ValueError:
+                writer.write(
+                    b"HTTP/1.1 400 Bad Request\r\n"
+                    b"Content-Type: text/plain\r\n"
+                    b"Connection: close\r\n\r\nParametros invalidos"
+                )
+                await writer.drain()
+
+        else:
+            writer.write(
+                b"HTTP/1.1 404 Not Found\r\n"
+                b"Content-Type: text/plain\r\n"
+                b"Connection: close\r\n\r\nNot found"
+            )
+            await writer.drain()
+
+    except asyncio.TimeoutError:
+        pass
+    except OSError as e:
+        print("Erro de socket HTTP:", e)
+    except Exception as e:
+        print("Erro na requisicao HTTP:", e)
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
 
 
-# --- EXECUÇÃO PRINCIPAL ---
-ip_local = iniciar_access_point()
-broker = MiniMQTTBroker(port=1883)
-broker.start()
+async def artnet_e_persistencia_task(state):
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
-web = MiniWebServer(broker, port=80)
-web.start()
-print(f"Acesse a interface em: http://{ip_local}/")
+    while True:
+        try:
+            udp.sendto(state.to_bytes(), (ARTNET_IP, ARTNET_PORT))
+        except OSError as e:
+            print("Erro ao enviar UDP Art-Net:", e)
 
-while True:
-    broker.loop()
-    web.loop()
-    time.sleep_ms(10)
+        state.save_if_needed()
+        await asyncio.sleep_ms(ARTNET_INTERVAL_MS)
+
+
+async def main_async():
+    state = LuminariaState()
+    state.load()
+
+    ip_local = iniciar_access_point()
+    asyncio.create_task(artnet_e_persistencia_task(state))
+
+    server = await asyncio.start_server(
+        lambda r, w: handle_client(r, w, state),
+        "0.0.0.0",
+        80,
+        backlog=4,
+    )
+    print(f"Servidor HTTP ativo em http://{ip_local}/")
+
+    async with server:
+        await server.serve_forever()
+
+
+try:
+    asyncio.run(main_async())
+finally:
+    asyncio.new_event_loop()
