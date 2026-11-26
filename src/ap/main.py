@@ -1,95 +1,87 @@
+# main.py - ESP32 padrao (MicroPython)
+# Access Point Wi-Fi + pagina web (roda de cores e intensidade) + transmissor Art-Net.
+#
+# Arquivos que precisam estar na flash desta placa, na raiz:
+#     main.py   index.html   site.js
+#
+# Rotas HTTP:
+#     /                  -> index.html
+#     /site.js           -> site.js
+#     /set?r=&g=&b=&d=   -> atualiza o estado (cor base em brilho maximo + intensidade), 204
+#     /state             -> estado atual em JSON
+#     /favicon.ico       -> 204
+#
+# Art-Net: a ~10 Hz, ArtDmx para o broadcast da rede do AP (192.168.4.255:6454)
+# com 4 slots a partir do endereco DMX: R, G, B, Intensidade.
+# O ESP32-C3 (c3/main.py) faz a mistura da intensidade, o gamma e o fade.
+
 import asyncio
 import json
+import machine
 import network
+import os
 import socket
+import struct
 import time
+from machine import WDT
 
-# --- CONFIGURAÇÕES DO ACCESS POINT E ART-NET ---
+# ======================= CONFIGURACAO =======================
 AP_SSID = "Bralight_AP"
-AP_PASS = "bralight123"  # Mínimo 8 caracteres
+AP_PASS = "bralight123"          # minimo 8 caracteres
 AP_CHANNEL = 6
 AP_MAX_CLIENTS = 4
 
-ARTNET_IP = "192.168.4.255"
+HTTP_PORT = 80
+
 ARTNET_PORT = 6454
-ARTNET_HZ = 10
-ARTNET_INTERVAL_MS = 1000 // ARTNET_HZ
+UNIVERSO = 0
+ENDERECO_DMX = 1                 # 1-based; tem que ser o mesmo do c3/main.py
+ENVIOS_POR_SEGUNDO = 10
 
-STATE_FILE = "rgb_state.json"
-SAVE_DELAY_MS = 2000
+ARQUIVO_ESTADO = "rgb_state.json"
+SALVAR_APOS_MS = 2000            # so grava na flash depois de 2 s sem mudancas
+
+TIMEOUT_HTTP_S = 5
+USAR_WDT = True                  # em desenvolvimento, ponha False (o WDT nao pode ser parado)
+WDT_MS = 8000
+
+# ======================= ESTADO =======================
+CHAVES = ("r", "g", "b", "d")
+estado = {"r": 255, "g": 0, "b": 0, "d": 255}
+meta = {"t_alteracao": 0}
 
 
-class LuminariaState:
-    def __init__(self, r=255, g=255, b=255, d=255):
-        self.r = r
-        self.g = g
-        self.b = b
-        self.d = d
-        self.dirty = False
-        self.last_change_ms = time.ticks_ms()
+def _byte(valor):
+    return max(0, min(255, int(valor)))
 
-    def update(self, r=None, g=None, b=None, d=None):
-        changed = False
-        if r is not None:
-            r = max(0, min(255, int(r)))
-            if r != self.r:
-                self.r = r
-                changed = True
-        if g is not None:
-            g = max(0, min(255, int(g)))
-            if g != self.g:
-                self.g = g
-                changed = True
-        if b is not None:
-            b = max(0, min(255, int(b)))
-            if b != self.b:
-                self.b = b
-                changed = True
-        if d is not None:
-            d = max(0, min(255, int(d)))
-            if d != self.d:
-                self.d = d
-                changed = True
 
-        if changed:
-            self.dirty = True
-            self.last_change_ms = time.ticks_ms()
+def carregar_estado():
+    try:
+        with open(ARQUIVO_ESTADO) as f:
+            salvo = json.load(f)
+        for k in CHAVES:
+            if k in salvo:
+                estado[k] = _byte(salvo[k])
+    except (OSError, ValueError, TypeError):
+        pass
 
-    def to_dict(self):
-        return {"r": self.r, "g": self.g, "b": self.b, "d": self.d}
 
-    def to_bytes(self):
-        return bytes([self.r, self.g, self.b, self.d])
-
-    def load(self):
-        try:
-            with open(STATE_FILE, "r") as f:
-                data = json.load(f)
-            self.r = max(0, min(255, int(data.get("r", self.r))))
-            self.g = max(0, min(255, int(data.get("g", self.g))))
-            self.b = max(0, min(255, int(data.get("b", self.b))))
-            self.d = max(0, min(255, int(data.get("d", self.d))))
-            self.dirty = False
-            print("Estado restaurado de", STATE_FILE, ":", self.to_dict())
-        except OSError:
-            print("Nenhum estado salvo encontrado; usando padrao:", self.to_dict())
-        except Exception as e:
-            print("Erro ao carregar estado:", e)
-
-    def save_if_needed(self):
-        if not self.dirty:
-            return
-        if time.ticks_diff(time.ticks_ms(), self.last_change_ms) >= SAVE_DELAY_MS:
+async def tarefa_salvar_estado():
+    ultimo_salvo = dict(estado)
+    while True:
+        await asyncio.sleep_ms(500)
+        parado = time.ticks_diff(time.ticks_ms(), meta["t_alteracao"]) > SALVAR_APOS_MS
+        if parado and estado != ultimo_salvo:
             try:
-                with open(STATE_FILE, "w") as f:
-                    json.dump(self.to_dict(), f)
-                self.dirty = False
-                print("Estado salvo em", STATE_FILE, ":", self.to_dict())
-            except Exception as e:
-                print("Erro ao salvar estado:", e)
+                with open(ARQUIVO_ESTADO, "w") as f:
+                    json.dump(estado, f)
+                ultimo_salvo = dict(estado)
+            except OSError as e:
+                print("Falha ao salvar estado:", e)
 
 
-def iniciar_access_point():
+# ======================= ACCESS POINT =======================
+def iniciar_ap():
     ap = network.WLAN(network.AP_IF)
     ap.active(True)
     ap.config(
@@ -99,131 +91,146 @@ def iniciar_access_point():
         channel=AP_CHANNEL,
         max_clients=AP_MAX_CLIENTS,
     )
-
     while not ap.active():
         time.sleep_ms(100)
-
-    ip = ap.ifconfig()[0]
-    print("\n--- Bralight Access Point Iniciado ---")
-    print("SSID:", AP_SSID)
-    print("Canal:", AP_CHANNEL, "| Max clientes:", AP_MAX_CLIENTS)
-    print("IP local (Web):", ip)
-    return ip
+    ip, mascara = ap.ifconfig()[0], ap.ifconfig()[1]
+    print("--- Bralight AP ---")
+    print("SSID:", AP_SSID, "| canal:", AP_CHANNEL, "| IP:", ip)
+    return ip, mascara
 
 
-def parse_query_params(raw_target):
-    if "?" not in raw_target:
-        return {}
-    query = raw_target.split("?", 1)[1]
+def calcular_broadcast(ip, mascara):
+    i = [int(x) for x in ip.split(".")]
+    m = [int(x) for x in mascara.split(".")]
+    return ".".join(str(i[k] | (255 - m[k])) for k in range(4))
+
+
+# ======================= ART-NET =======================
+def artdmx(seq, universo, slots):
+    if len(slots) % 2:
+        slots += b"\x00"
+    return (
+        b"Art-Net\x00\x00\x50\x00\x0e"
+        + bytes([seq & 255, 0, universo & 255, (universo >> 8) & 127])
+        + struct.pack(">H", len(slots))
+        + slots
+    )
+
+
+async def tarefa_artnet(destino_ip):
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        udp.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    except Exception:
+        pass    # nem todo build do MicroPython expoe SO_BROADCAST; o envio costuma funcionar assim mesmo
+    seq = 0
+    erro_anterior = None
+    intervalo = 1000 // ENVIOS_POR_SEGUNDO
+    while True:
+        seq = (seq % 255) + 1
+        slots = bytes(ENDERECO_DMX - 1) + bytes(
+            (estado["r"], estado["g"], estado["b"], estado["d"])
+        )
+        try:
+            udp.sendto(artdmx(seq, UNIVERSO, slots), (destino_ip, ARTNET_PORT))
+            erro_anterior = None
+        except OSError as e:
+            if str(e) != erro_anterior:       # nao inunda o console
+                print("Falha ao enviar Art-Net:", e)
+                erro_anterior = str(e)
+        await asyncio.sleep_ms(intervalo)
+
+
+# ======================= SERVIDOR HTTP =======================
+STATUS = {200: "OK", 204: "No Content", 400: "Bad Request", 404: "Not Found"}
+
+
+def cabecalho(codigo, tipo=None, tamanho=0):
+    h = "HTTP/1.1 %d %s\r\n" % (codigo, STATUS[codigo])
+    if tipo:
+        h += "Content-Type: %s\r\n" % tipo
+    h += "Content-Length: %d\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n" % tamanho
+    return h.encode()
+
+
+async def responder(writer, codigo, tipo=None, corpo=b""):
+    writer.write(cabecalho(codigo, tipo, len(corpo)))
+    if corpo:
+        writer.write(corpo)
+    await writer.drain()
+
+
+async def enviar_arquivo(writer, caminho, tipo):
+    try:
+        tamanho = os.stat(caminho)[6]
+        f = open(caminho, "rb")
+    except OSError:
+        await responder(writer, 404, "text/plain", b"arquivo nao encontrado")
+        return
+    try:
+        writer.write(cabecalho(200, tipo, tamanho))
+        await writer.drain()
+        while True:
+            bloco = f.read(1024)
+            if not bloco:
+                break
+            writer.write(bloco)
+            await writer.drain()
+    finally:
+        f.close()
+
+
+def parse_query(alvo):
     params = {}
-    for pair in query.split("&"):
-        if "=" in pair:
-            k, v = pair.split("=", 1)
-            params[k] = v
+    if "?" in alvo:
+        for parte in alvo.split("?", 1)[1].split("&"):
+            if "=" in parte:
+                k, v = parte.split("=", 1)
+                params[k] = v
     return params
 
 
-def content_type_for(path):
-    if path.endswith(".html"):
-        return "text/html; charset=utf-8"
-    if path.endswith(".js"):
-        return "application/javascript; charset=utf-8"
-    if path.endswith(".css"):
-        return "text/css; charset=utf-8"
-    if path.endswith(".json"):
-        return "application/json; charset=utf-8"
-    return "application/octet-stream"
-
-
-async def send_file_chunked(writer, filepath):
-    ctype = content_type_for(filepath)
-    header = (
-        "HTTP/1.1 200 OK\r\n"
-        f"Content-Type: {ctype}\r\n"
-        "Cache-Control: no-cache\r\n"
-        "Connection: close\r\n\r\n"
-    ).encode("utf-8")
-    writer.write(header)
-    await writer.drain()
-
-    with open(filepath, "rb") as f:
-        while True:
-            chunk = f.read(512)
-            if not chunk:
-                break
-            writer.write(chunk)
-            await writer.drain()
-
-
-async def handle_client(reader, writer, state):
+async def tratar_cliente(reader, writer):
     try:
-        request_line = await asyncio.wait_for(reader.readline(), timeout=2.0)
-        if not request_line:
-            return
-
-        # Consome o restante dos cabeçalhos HTTP
-        while True:
-            line = await asyncio.wait_for(reader.readline(), timeout=2.0)
-            if not line or line == b"\r\n":
+        linha = await asyncio.wait_for(reader.readline(), TIMEOUT_HTTP_S)
+        partes = linha.split()
+        if len(partes) < 2:
+            return                      # conexao vazia (preconnect do navegador)
+        while True:                     # descarta os cabecalhos
+            h = await asyncio.wait_for(reader.readline(), TIMEOUT_HTTP_S)
+            if not h or h == b"\r\n" or h == b"\n":
                 break
 
-        parts = request_line.decode("utf-8", "ignore").strip().split(" ")
-        target = parts[1] if len(parts) >= 2 else "/"
-        path = target.split("?", 1)[0]
+        alvo = partes[1].decode()
+        caminho = alvo.split("?", 1)[0]
 
-        if path == "/":
-            await send_file_chunked(writer, "index.html")
-
-        elif path == "/site.js":
-            await send_file_chunked(writer, "site.js")
-
-        elif path == "/favicon.ico":
-            writer.write(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
-            await writer.drain()
-
-        elif path == "/state":
-            body = json.dumps(state.to_dict()).encode("utf-8")
-            resp = (
-                b"HTTP/1.1 200 OK\r\n"
-                b"Content-Type: application/json; charset=utf-8\r\n"
-                b"Cache-Control: no-cache\r\n"
-                b"Connection: close\r\n\r\n" + body
-            )
-            writer.write(resp)
-            await writer.drain()
-
-        elif path == "/set":
-            params = parse_query_params(target)
+        if caminho == "/" or caminho == "/index.html":
+            await enviar_arquivo(writer, "index.html", "text/html; charset=utf-8")
+        elif caminho == "/site.js":
+            await enviar_arquivo(writer, "site.js", "application/javascript; charset=utf-8")
+        elif caminho == "/set":
+            params = parse_query(alvo)
+            novo = dict(estado)
             try:
-                r = int(params["r"]) if "r" in params else None
-                g = int(params["g"]) if "g" in params else None
-                b = int(params["b"]) if "b" in params else None
-                d = int(params["d"]) if "d" in params else None
-                state.update(r=r, g=g, b=b, d=d)
-                writer.write(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
-                await writer.drain()
+                for k in CHAVES:
+                    if k in params:
+                        novo[k] = _byte(params[k])
             except ValueError:
-                writer.write(
-                    b"HTTP/1.1 400 Bad Request\r\n"
-                    b"Content-Type: text/plain\r\n"
-                    b"Connection: close\r\n\r\nParametros invalidos"
-                )
-                await writer.drain()
-
+                await responder(writer, 400, "text/plain", b"parametros invalidos")
+                return
+            if novo != estado:
+                estado.update(novo)
+                meta["t_alteracao"] = time.ticks_ms()
+            await responder(writer, 204)
+        elif caminho == "/state":
+            await responder(writer, 200, "application/json", json.dumps(estado).encode())
+        elif caminho == "/favicon.ico":
+            await responder(writer, 204)
         else:
-            writer.write(
-                b"HTTP/1.1 404 Not Found\r\n"
-                b"Content-Type: text/plain\r\n"
-                b"Connection: close\r\n\r\nNot found"
-            )
-            await writer.drain()
-
-    except asyncio.TimeoutError:
-        pass
-    except OSError as e:
-        print("Erro de socket HTTP:", e)
-    except Exception as e:
-        print("Erro na requisicao HTTP:", e)
+            await responder(writer, 404, "text/plain", b"nao encontrado")
+    except Exception as e:              # inclui timeout e cliente que desconectou
+        if not isinstance(e, OSError):
+            print("Erro HTTP:", repr(e))
     finally:
         try:
             writer.close()
@@ -232,40 +239,34 @@ async def handle_client(reader, writer, state):
             pass
 
 
-async def artnet_e_persistencia_task(state):
-    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+# ======================= PRINCIPAL =======================
+async def tarefa_wdt(wdt):
+    while True:
+        wdt.feed()
+        await asyncio.sleep_ms(1000)
+
+
+async def principal():
+    carregar_estado()
+    ip, mascara = iniciar_ap()
+    broadcast = calcular_broadcast(ip, mascara)
+
+    await asyncio.start_server(tratar_cliente, "0.0.0.0", HTTP_PORT)
+    print("Pagina: http://%s/  | Art-Net ->" % ip, broadcast, ARTNET_PORT)
+
+    asyncio.create_task(tarefa_artnet(broadcast))
+    asyncio.create_task(tarefa_salvar_estado())
+    if USAR_WDT:
+        asyncio.create_task(tarefa_wdt(WDT(timeout=WDT_MS)))
 
     while True:
-        try:
-            udp.sendto(state.to_bytes(), (ARTNET_IP, ARTNET_PORT))
-        except OSError as e:
-            print("Erro ao enviar UDP Art-Net:", e)
-
-        state.save_if_needed()
-        await asyncio.sleep_ms(ARTNET_INTERVAL_MS)
+        await asyncio.sleep(3600)
 
 
-async def main_async():
-    state = LuminariaState()
-    state.load()
-
-    ip_local = iniciar_access_point()
-    asyncio.create_task(artnet_e_persistencia_task(state))
-
-    server = await asyncio.start_server(
-        lambda r, w: handle_client(r, w, state),
-        "0.0.0.0",
-        80,
-        backlog=4,
-    )
-    print(f"Servidor HTTP ativo em http://{ip_local}/")
-
-    async with server:
-        await server.serve_forever()
-
-
-try:
-    asyncio.run(main_async())
-finally:
-    asyncio.new_event_loop()
+if __name__ == "__main__":
+    try:
+        asyncio.run(principal())
+    except Exception as e:
+        print("Erro fatal:", e)
+        time.sleep(2)
+        machine.reset()
